@@ -35,8 +35,7 @@ typedef struct {
 typedef struct {
     ngx_http_lua_co_ctx_t       *coctx;
     ngx_http_request_t *r;
-    const char *code; /* TODO: rename that (it is used for code AND return) */
-    size_t codelen;
+    lua_State *L;
     ngx_int_t nres; /* result count */
     ngx_http_resty_threadpool_task_status_t status;
 } ngx_thread_lua_task_ctx_t;
@@ -81,16 +80,15 @@ ngx_http_resty_threadpool_task_handler(void *data, ngx_log_t *log)
      * code in the thread state.
      */
     ngx_thread_lua_task_ctx_t *ctx = data;
-    lua_State                 *L;
+    lua_State                 *L = ctx->L;
 
     // TODO: create an actual lua-nginx-module state
     // TODO: cache states (thread local)
     ctx->status = LUA_THREADPOOL_TASK_RUNNING;
-    L = luaL_newstate();
-    luaL_openlibs(L);
 
     // TODO: support for loading bytecode
-    if (luaL_dostring(L, ctx->code)) {
+    ngx_http_lua_assert(lua_type(L, 1) == LUA_TSTRING);
+    if (luaL_dostring(L, lua_tostring(L, 1))) {
         const char *msg = lua_tostring(L, -1);
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "failed to run lua code in thread: %s", msg);
@@ -106,21 +104,10 @@ ngx_http_resty_threadpool_task_handler(void *data, ngx_log_t *log)
     case 0:
         ctx->nres = 0;
         break;
-    case 1: {
-        const char *serialized;
+    case 1:
         ctx->nres = 1;
         luaser_encode(L, 1);
-        serialized = lua_tolstring(L, -1, &ctx->codelen);
-        /* TODO: find a better way to transfer results */
-        ctx->code = malloc(ctx->codelen);
-        if (ctx->code == NULL) {
-            ngx_log_error(NGX_LOG_ERR, log, 0,
-                          "failed to allocate result buffer (%z bytes) for lua task", ctx->codelen);
-            goto failed;
-        }
-        memcpy((char *)ctx->code, serialized, ctx->codelen);
         break;
-    }
     default:
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "multiple results not handled in lua thread (got %d values)", lua_gettop(L));
@@ -132,8 +119,6 @@ ngx_http_resty_threadpool_task_handler(void *data, ngx_log_t *log)
     return;
 failed:
     ctx->nres = 0;
-    ctx->codelen = 0;
-    ctx->code = NULL;
     ctx->status = LUA_THREADPOOL_TASK_FAILED;
     lua_close(L);
 }
@@ -158,7 +143,7 @@ ngx_http_resty_threadpool_thread_event_handler(ngx_event_t *ev)
 
     luactx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
     if (luactx == NULL) {
-        free((void *)ctx->code);
+        lua_close(ctx->L);
         ctx->status = LUA_THREADPOOL_TASK_DESTROYED;
         return; /* not sure what it means in this case */
     }
@@ -176,9 +161,14 @@ ngx_http_resty_threadpool_thread_event_handler(ngx_event_t *ev)
     /* prepare_retvals(r, u, ctx->cur_co_ctx->co); */
     /*  >>>>>> TODO <<<<<< */
     if (ctx->nres == 1) {
-        luaser_decode(coctx->co, ctx->code, ctx->codelen);
-        free((void *)ctx->code);
+        const char *res;
+        size_t reslen;
+        ngx_http_lua_assert(lua_type(ctx-L, -1) == LUA_TSTRING);
+        res = lua_tolstring(ctx->L, -1, &reslen);
+        luaser_decode(coctx->co, res, reslen);
+        lua_close(ctx->L);
     }
+    ctx->status = LUA_THREADPOOL_TASK_DESTROYED;
     coctx->cleanup = NULL;
 
     luactx->cur_co_ctx = coctx;
@@ -259,7 +249,6 @@ ngx_http_resty_threadpool_push_task(lua_State *L) {
         return luaL_error(L, "no request found");
     }
 
-    /* FIXME: anchor the string somewhere in the VM to prevent GC */
     pool.data = (u_char *)luaL_checklstring(L, 1, &pool.len);
     code = luaL_checklstring(L, 2, &codelen);
 
@@ -289,12 +278,20 @@ ngx_http_resty_threadpool_push_task(lua_State *L) {
     task->handler = ngx_http_resty_threadpool_task_handler;
     ctx = task->ctx;
     ctx->status = LUA_THREADPOOL_TASK_QUEUED;
-    ctx->code = code;
-    ctx->codelen = codelen;
     ctx->coctx = coctx;
     ctx->r = r;
 
-    // return handler
+    /* prepare the state: just push the code for now, the actual loading will
+     * be done in thread */
+    ctx->L = luaL_newstate();
+    if (ctx->L == NULL) {
+        return luaL_error(L, "failed to create task state");
+    }
+
+    luaL_openlibs(ctx->L); /* TODO: no time for that in I/O loop, do it in thread */
+    lua_pushlstring(ctx->L, code, codelen);
+
+    /* return handler */
     task->event.data = ctx;
     task->event.handler = ngx_http_resty_threadpool_thread_event_handler;
 
