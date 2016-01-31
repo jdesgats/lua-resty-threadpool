@@ -79,16 +79,22 @@ ngx_http_resty_threadpool_task_handler(void *data, ngx_log_t *log)
     /* called from inside the worker thread: responsible to run the actual Lua
      * code in the thread state.
      */
+    const char                *code;
+    size_t                     codelen;
     ngx_thread_lua_task_ctx_t *ctx = data;
     lua_State                 *L = ctx->L;
 
     // TODO: create an actual lua-nginx-module state
     // TODO: cache states (thread local)
     ctx->status = LUA_THREADPOOL_TASK_RUNNING;
+    luaL_openlibs(ctx->L);
 
     // TODO: support for loading bytecode
     ngx_http_lua_assert(lua_type(L, 1) == LUA_TSTRING);
-    if (luaL_dostring(L, lua_tostring(L, 1))) {
+    code = lua_tolstring(L, 1, &codelen);
+    luaser_decode(L, code, codelen);
+    lua_remove(L, 1); /* the parameters can be GCed now */
+    if (lua_pcall(L, 0, LUA_MULTRET, 0)) {
         const char *msg = lua_tostring(L, -1);
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "failed to run lua code in thread: %s", msg);
@@ -115,12 +121,10 @@ ngx_http_resty_threadpool_task_handler(void *data, ngx_log_t *log)
     }
 
     ctx->status = LUA_THREADPOOL_TASK_SUCCESS;
-    lua_close(L);
     return;
 failed:
     ctx->nres = 0;
     ctx->status = LUA_THREADPOOL_TASK_FAILED;
-    lua_close(L);
 }
 
 static void
@@ -159,7 +163,6 @@ ngx_http_resty_threadpool_thread_event_handler(ngx_event_t *ev)
 
     /* push results into the main coroutine */
     /* prepare_retvals(r, u, ctx->cur_co_ctx->co); */
-    /*  >>>>>> TODO <<<<<< */
     if (ctx->nres == 1) {
         const char *res;
         size_t reslen;
@@ -250,7 +253,7 @@ ngx_http_resty_threadpool_push_task(lua_State *L) {
     }
 
     pool.data = (u_char *)luaL_checklstring(L, 1, &pool.len);
-    code = luaL_checklstring(L, 2, &codelen);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
 
     luactx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
     if (luactx == NULL) {
@@ -288,7 +291,8 @@ ngx_http_resty_threadpool_push_task(lua_State *L) {
         return luaL_error(L, "failed to create task state");
     }
 
-    luaL_openlibs(ctx->L); /* TODO: no time for that in I/O loop, do it in thread */
+    luaser_encode(L, 2);
+    code = lua_tolstring(L, -1, &codelen);
     lua_pushlstring(ctx->L, code, codelen);
 
     /* return handler */
