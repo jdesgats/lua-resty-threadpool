@@ -14,15 +14,13 @@
 
 #include "serialize.h"
 
-// FIXME: test only
-#include <pthread.h>
-
 #ifndef NGX_THREADS
 # error thread support required
 #endif
 
 typedef enum {
-    LUA_THREADPOOL_TASK_QUEUED,
+    LUA_THREADPOOL_TASK_CREATED,
+    LUA_THREADPOOL_TASK_YIELDED,
     LUA_THREADPOOL_TASK_RUNNING,
     LUA_THREADPOOL_TASK_SUCCESS,
     LUA_THREADPOOL_TASK_FAILED,
@@ -80,47 +78,65 @@ ngx_http_resty_threadpool_task_handler(void *data, ngx_log_t *log)
      * code in the thread state.
      */
     const char                *code;
-    size_t                     codelen;
     ngx_thread_lua_task_ctx_t *ctx = data;
     lua_State                 *L = ctx->L;
+    lua_State                 *co;
+    size_t                     codelen;
+    ngx_int_t                  i, nres;
 
-    // TODO: create an actual lua-nginx-module state
-    // TODO: cache states (thread local)
+    if (ctx->status == LUA_THREADPOOL_TASK_CREATED) {
+        /* new task, setup the state */
+        luaL_openlibs(ctx->L);
+
+        ngx_http_lua_assert(lua_type(L, 1) == LUA_TSTRING);
+        code = lua_tolstring(L, 1, &codelen);
+        co = lua_newthread(L);
+        luaser_decode(co, code, codelen);
+        lua_remove(L, 1); /* the parameters can be GCed now */
+        ngx_http_lua_assert(lua_gettop(L) == 1);
+    } else {
+        /* already created: the running coro is still on the top of the stack */
+        ngx_http_lua_assert(ctx->status == LUA_THREADPOOL_TASK_YIELDED);
+        ngx_http_lua_assert(lua_gettop(L) == 1);
+        co = lua_tothread(L, 1);
+        ngx_http_lua_assert(co != NULL && lua_gettop(co) == 0);
+    }
+
     ctx->status = LUA_THREADPOOL_TASK_RUNNING;
-    luaL_openlibs(ctx->L);
-
-    // TODO: support for loading bytecode
-    ngx_http_lua_assert(lua_type(L, 1) == LUA_TSTRING);
-    code = lua_tolstring(L, 1, &codelen);
-    luaser_decode(L, code, codelen);
-    lua_remove(L, 1); /* the parameters can be GCed now */
-    if (lua_pcall(L, 0, LUA_MULTRET, 0)) {
-        const char *msg = lua_tostring(L, -1);
+    switch (lua_resume(co, 0)) {
+    case 0: /* finished */
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0, "lua task completed");
+        ctx->status = LUA_THREADPOOL_TASK_SUCCESS;
+        break;
+    case LUA_YIELD:
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0, "lua task suspended");
+        ctx->status = LUA_THREADPOOL_TASK_YIELDED;
+        break;
+    default: { /* error */
+        const char *msg = lua_tostring(co, -1);
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "failed to run lua code in thread: %s", msg);
         goto failed;
+    }
     }
 
     /* serialize returned values */
     /* TODO: bench that, matbe it worth making a special case when the result
      * is a single string (avoid to make too many copies).
-     * TODO: support multiple resuts
+     * TODO: the serialization could actually use the main thread instead of creating one
      */
-    switch (lua_gettop(L)) {
-    case 0:
-        ctx->nres = 0;
-        break;
-    case 1:
-        ctx->nres = 1;
-        luaser_encode(L, 1);
-        break;
-    default:
-        ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "multiple results not handled in lua thread (got %d values)", lua_gettop(L));
-        goto failed;
+    nres = lua_gettop(co);
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, log, 0,
+                   "lua task returned %d results: \"%V?%V\"",
+                   nres, &(ctx->r->uri), &(ctx->r->args));
+    for (i = 1; i <= nres; i++) {
+        luaser_encode(co, i);
     }
-
-    ctx->status = LUA_THREADPOOL_TASK_SUCCESS;
+    lua_xmove(co, L, nres);
+    lua_pop(co, nres); /* TODO: lua_settop(co, 0); */
+    ngx_http_lua_assert(lua_gettop(co) == 0);
+    ngx_http_lua_assert(lua_gettop(L) == 1 + nres); /* (thread, res1, ..., resN) */
+    ctx->nres = nres;
     return;
 failed:
     ctx->nres = 0;
@@ -137,6 +153,7 @@ ngx_http_resty_threadpool_thread_event_handler(ngx_event_t *ev)
     ngx_thread_lua_task_ctx_t   *ctx;
     ngx_http_lua_ctx_t          *luactx;
     ngx_http_lua_co_ctx_t       *coctx;
+    ngx_int_t                    i;
 
     ctx = ev->data;
     coctx = ctx->coctx;
@@ -157,22 +174,26 @@ ngx_http_resty_threadpool_thread_event_handler(ngx_event_t *ev)
         log_ctx->current_request = r;
     }
 
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                   "lua task completed with %d results: \"%V?%V\"",
-                  ctx->nres, &r->uri, &r->args);
+    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "lua task status: %d with %d results: \"%V?%V\"",
+                   ctx->status, ctx->nres, &r->uri, &r->args);
 
     /* push results into the main coroutine */
     /* prepare_retvals(r, u, ctx->cur_co_ctx->co); */
-    if (ctx->nres == 1) {
+    for (i=1; i <= ctx->nres; i++) {
         const char *res;
         size_t reslen;
-        ngx_http_lua_assert(lua_type(ctx-L, -1) == LUA_TSTRING);
-        res = lua_tolstring(ctx->L, -1, &reslen);
+        ngx_http_lua_assert(lua_type(ctx->L, 1+i) == LUA_TSTRING);
+        res = lua_tolstring(ctx->L, 1+i, &reslen);
         luaser_decode(coctx->co, res, reslen);
-        lua_close(ctx->L);
     }
-    ctx->status = LUA_THREADPOOL_TASK_DESTROYED;
-    coctx->cleanup = NULL;
+
+    if (ctx->status == LUA_THREADPOOL_TASK_SUCCESS ||
+        ctx->status == LUA_THREADPOOL_TASK_FAILED)
+    {
+        lua_close(ctx->L);
+        coctx->cleanup = NULL;
+    }
 
     luactx->cur_co_ctx = coctx;
     if (luactx->entered_content_phase) {
@@ -280,7 +301,7 @@ ngx_http_resty_threadpool_push_task(lua_State *L) {
 
     task->handler = ngx_http_resty_threadpool_task_handler;
     ctx = task->ctx;
-    ctx->status = LUA_THREADPOOL_TASK_QUEUED;
+    ctx->status = LUA_THREADPOOL_TASK_CREATED;
     ctx->coctx = coctx;
     ctx->r = r;
 
@@ -306,7 +327,6 @@ ngx_http_resty_threadpool_push_task(lua_State *L) {
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "post Lua task to thread pool %V", &pool);
-    fprintf(stderr, "can I haz a thread: %ld\n", pthread_self());
 
     if (ngx_thread_task_post(tp, task) != NGX_OK) {
         return luaL_error(L, "failed to post task to queue");
@@ -317,7 +337,6 @@ ngx_http_resty_threadpool_push_task(lua_State *L) {
 
 int
 luaopen_resty_threadpool(lua_State *L) {
-    fprintf(stderr, "luaded...\n");
     lua_pushcfunction(L, ngx_http_resty_threadpool_push_task);
     return 1;
 }
