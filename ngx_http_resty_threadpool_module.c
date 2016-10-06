@@ -176,6 +176,7 @@ ngx_http_resty_threadpool_thread_event_handler(ngx_event_t *ev)
     luactx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
     if (luactx == NULL) {
         lua_close(ctx->thread->L);
+        ctx->thread->L = NULL;
         ctx->thread->status = LUA_THREADPOOL_TASK_DESTROYED;
         return; /* not sure what it means in this case */
     }
@@ -205,6 +206,8 @@ ngx_http_resty_threadpool_thread_event_handler(ngx_event_t *ev)
         ctx->thread->status == LUA_THREADPOOL_TASK_FAILED)
     {
         lua_close(ctx->thread->L);
+        ctx->thread->L = NULL;
+        ctx->thread->status = LUA_THREADPOOL_TASK_DESTROYED;
         coctx->cleanup = NULL;
     }
 
